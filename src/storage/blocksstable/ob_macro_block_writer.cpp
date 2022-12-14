@@ -26,6 +26,7 @@
 #include "storage/ddl/ob_ddl_redo_log_writer.h"
 #include "storage/ob_i_store.h"
 #include "storage/ob_sstable_struct.h"
+#include "isa-l/crc.h"
 
 namespace oceanbase
 {
@@ -166,13 +167,59 @@ int ObMicroBlockBufferHelper::check_micro_block_checksum(
     STORAGE_LOG(WARN, "micro block reader is null", K(ret), K(buf), K(size), K(micro_reader));
   } else {
     int64_t new_checksum = 0;
-    for (int64_t it = 0; OB_SUCC(ret) && it != micro_reader->row_count(); ++it) {
-      if (OB_FAIL(micro_reader->get_row(it, check_datum_row_))) {
-        STORAGE_LOG(WARN, "get_row failed", K(ret), K(it), K(*data_store_desc_));
+    ObMicroBlockDecoder *micro_block_decoder = NULL;
+    if (OB_ISNULL(micro_block_decoder = dynamic_cast<ObMicroBlockDecoder *>(micro_reader))) {
+      for (int64_t it = 0; OB_SUCC(ret) && it != micro_reader->row_count(); ++it) {
+        if (OB_FAIL(micro_reader->get_row(it, check_datum_row_))) {
+          STORAGE_LOG(WARN, "get_row failed", K(ret), K(it), K(*data_store_desc_));
+        } else {
+          for (int64_t i = 0; i < check_datum_row_.get_column_count(); ++i) {
+            const ObStorageDatum &datum = check_datum_row_.storage_datums_[i];
+            new_checksum = crc32_iscsi((unsigned char *)(&datum.pack_), sizeof(datum.pack_), new_checksum);
+            if (OB_LIKELY(datum.len_ > 0)) {
+              new_checksum = crc32_iscsi((unsigned char *)(datum.ptr_), datum.len_, new_checksum);
+            }
+          }
+        }
+      }
+    } else {
+      int64_t row_count = micro_reader->row_count();
+      int64_t column_count = data_store_desc_->row_column_count_;
+      common::ObArray<int32_t> cols;
+      common::ObArray<const share::schema::ObColumnParam *> col_params;
+      int64_t *row_ids = static_cast<int64_t *>(allocator_.alloc(sizeof(int64_t) * row_count));
+      const char **cell_datas = static_cast<const char **>(allocator_.alloc(sizeof(char *) * row_count));
+      common::ObArray<ObDatum *> datums;
+      for (int64_t i = 0; i < column_count; ++i) {
+        cols.push_back(i);
+        col_params.push_back(NULL);
+        ObDatum *col_datums = static_cast<ObDatum *>(allocator_.alloc(sizeof(ObStorageDatum) * row_count));
+        char *buf = static_cast<char *>(allocator_.alloc(common::OBJ_DATUM_NUMBER_RES_SIZE * row_count));
+        for (int row = 0; row < row_count; ++row) {
+          col_datums[row].ptr_ = buf;
+          buf += common::OBJ_DATUM_NUMBER_RES_SIZE;
+        }
+        datums.push_back(col_datums);
+      }
+      for (int64_t i = 0; i < row_count; ++i) {
+        row_ids[i] = i;
+      }
+      if (OB_FAIL(micro_block_decoder->get_rows(
+          cols, col_params, row_ids, cell_datas, row_count, datums))) {
+        STORAGE_LOG(WARN, "KON get_rows failed", K(ret));
       } else {
-        new_checksum = ObIMicroBlockWriter::cal_row_checksum(check_datum_row_, new_checksum);
+        for (int64_t row = 0; row < row_count; ++row) {
+          for (int64_t col = 0; col < column_count; ++col) {
+            const ObDatum &datum = datums[col][row];
+            new_checksum = crc32_iscsi((unsigned char *)(&datum.pack_), sizeof(datum.pack_), new_checksum);
+            if (OB_LIKELY(datum.len_ > 0)) {
+              new_checksum = crc32_iscsi((unsigned char *)(datum.ptr_), datum.len_, new_checksum);
+            }
+          }
+        }
       }
     }
+
     if (OB_SUCC(ret)) {
       if (checksum != new_checksum) {
         print_micro_block_row(micro_reader);

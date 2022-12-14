@@ -31,6 +31,7 @@
 #include "ob_encoding_hash_util.h"
 #include "ob_string_prefix_encoder.h"
 #include "ob_inter_column_substring_encoder.h"
+#include "isa-l/crc.h"
 
 namespace oceanbase
 {
@@ -241,7 +242,14 @@ void ObMicroBlockEncoder::reuse()
 int ObMicroBlockEncoder::calc_and_validate_checksum(const ObDatumRow &row)
 {
   int ret = OB_SUCCESS;
-  micro_block_checksum_ = cal_row_checksum(row, micro_block_checksum_);
+  for (int64_t i = 0; i < row.get_column_count(); ++i) {
+    const ObStorageDatum &datum = row.storage_datums_[i];
+    micro_block_checksum_ = crc32_iscsi((unsigned char *)(&datum.pack_), sizeof(datum.pack_), micro_block_checksum_);
+    if (OB_LIKELY(datum.len_ > 0)) {
+      micro_block_checksum_ = crc32_iscsi((unsigned char *)(datum.ptr_), datum.len_, micro_block_checksum_);
+    }
+  }
+  // micro_block_checksum_ = cal_row_checksum(row, micro_block_checksum_);
   if (OB_LIKELY(micro_block_merge_verify_level_ <
       MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING_AND_COMPRESSION_AND_WRITE_COMPLETE)) {
     // do nothing
@@ -362,6 +370,20 @@ int ObMicroBlockEncoder::try_to_append_row(const int64_t &store_size)
   return ret;
 }
 
+static int kon_cal_column_checksum(const ObDatumRow &row, int64_t *curr_micro_column_checksum)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; i < row.get_column_count(); ++i) {
+    const ObStorageDatum &datum = row.storage_datums_[i];
+    int32_t result = crc32_iscsi((unsigned char *)(&datum.pack_), sizeof(datum.pack_), 0);
+    if (OB_LIKELY(datum.len_ > 0)) {
+      result = crc32_iscsi((unsigned char *)(datum.ptr_), datum.len_, result);
+    }
+    curr_micro_column_checksum[i] += result;
+  }
+  return ret;
+}
+
 int ObMicroBlockEncoder::append_row(const ObDatumRow &row)
 {
   int ret = OB_SUCCESS;
@@ -407,7 +429,7 @@ int ObMicroBlockEncoder::append_row(const ObDatumRow &row)
         LOG_WARN("copy and append row failed", K(ret));
       }
     } else if (header_->has_column_checksum_
-        && OB_FAIL(cal_column_checksum(row, header_->column_checksums_))) {
+        && OB_FAIL(kon_cal_column_checksum(row, header_->column_checksums_))) {
       LOG_WARN("cal column checksum failed", K(ret), K(row));
     } else if (need_cal_row_checksum() && OB_FAIL(calc_and_validate_checksum(row))) {
       LOG_WARN("fail to calc and validate row checksum", K(ret), K_(ctx));
@@ -971,10 +993,10 @@ int ObMicroBlockEncoder::copy_cell(
   int64_t datum_size = 0;
   dest.ptr_ = row_buf_holder_.get_buf() + length_;
   dest.pack_ = src.pack_;
-  if (src.is_null()) {
+  if (OB_UNLIKELY(src.is_null())) {
     dest.set_null();
     datum_size = sizeof(uint64_t);
-  } else if (src.is_nop()) {
+  } else if (OB_UNLIKELY(src.is_nop())) {
     datum_size = dest.len_;
   } else if (OB_UNLIKELY(src.is_ext())) {
     ret = OB_NOT_SUPPORTED;
@@ -985,11 +1007,11 @@ int ObMicroBlockEncoder::copy_cell(
 
   if (OB_FAIL(ret)) {
   } else if (FALSE_IT(store_size += datum_size)) {
-  } else if (datum_rows_.count() > 0 && estimate_size_ + store_size >= estimate_size_limit_) {
+  } else if (OB_UNLIKELY(datum_rows_.count() > 0 && estimate_size_ + store_size >= estimate_size_limit_)) {
     ret = OB_BUF_NOT_ENOUGH;
     // for large row whose size larger than a micro block default size,
     // we still use micro block to store it, but its size is unknown, need special treat
-  } else if (datum_rows_.count() == 0 && estimate_size_ + store_size >= estimate_size_limit_) {
+  } else if (OB_UNLIKELY(datum_rows_.count() == 0 && estimate_size_ + store_size >= estimate_size_limit_)) {
     is_large_row = true;
   } else {
     if (is_int_sc) {

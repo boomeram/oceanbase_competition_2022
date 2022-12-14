@@ -12,6 +12,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#define XXH_PRIVATE_API
 #include "ob_encoding_hash_util.h"
 #include <cmath>
 #include "lib/container/ob_array.h"
@@ -127,16 +128,17 @@ int ObEncodingHashTableBuilder::build(const ObColDatums &col_datums, const ObCol
         OB_SUCC(ret) && row_id < col_datums.count() && list_cnt_ < list_num_;
         ++row_id) {
       const ObDatum &datum = col_datums.at(row_id);
-      if (datum.is_null()) {
+      if (OB_UNLIKELY(datum.is_null())) {
         add_to_list(null_nodes_, nodes_[row_id], datum);
-      } else if (datum.is_nop()) {
+      } else if (OB_UNLIKELY(datum.is_nop())) {
         add_to_list(nope_nodes_, nodes_[row_id], datum);
-      } else if (datum.is_ext()) {
+      } else if (OB_UNLIKELY(datum.is_ext())) {
         ret = common::OB_NOT_SUPPORTED;
         STORAGE_LOG(WARN, "not supported extend object type",
             K(ret), K(row_id), K(datum), K(*datum.extend_obj_));
       } else {
-        int64_t pos = hash(datum, hash_func, need_binary_hash) & mask;
+        int64_t pos = XXH32(datum.ptr_, static_cast<size_t>(datum.len_), 0) & mask;
+        // int64_t pos = hash(datum, hash_func, need_binary_hash) & mask;
         NodeList *list = buckets_[pos];
         while (OB_SUCC(ret) && nullptr != list) {
           bool is_equal = false;
